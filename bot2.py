@@ -17,7 +17,7 @@ LIKE_LIMIT = int(os.getenv("BOT2_LIKE_LIMIT", "3"))
 REPOST_LIMIT = int(os.getenv("BOT2_REPOST_LIMIT", "1"))
 SOURCE_HANDLES = [h.strip() for h in os.getenv("BOT2_SOURCE_HANDLES", "").split(",") if h.strip()]
 
-# --- Posts originaux (déjà existant) ---
+# --- Posts originaux ---
 DO_ORIGINAL_POST_WEIGHT = float(os.getenv("BOT2_ORIGINAL_POST_WEIGHT", "0.25"))  # 25% des runs ≈ post original
 ORIGINAL_POSTS = [
     "Exploring stories in color and motion 🎨✨",
@@ -30,8 +30,8 @@ LINK_SITE = os.getenv("BOT2_LINK_SITE", "https://louphi1987.github.io/Site_de_Lo
 LINK_OPENSEA = os.getenv("BOT2_LINK_OPENSEA", "https://opensea.io/collection/loufis-art")
 APPEND_LINK_PROB = float(os.getenv("BOT2_APPEND_LINK_PROB", "0.5"))  # 50% des posts originaux ajoutent un lien
 
-# --- NOUVEAU : Promo Pictnart (≈10% du temps) ---
-PICTNART_WEIGHT = float(os.getenv("BOT2_PICTNART_WEIGHT", "0.10"))  # 10% du temps un post dédié Pictnart
+# --- Pictnart (≈10% du temps) ---
+PICTNART_WEIGHT = float(os.getenv("BOT2_PICTNART_WEIGHT", "0.10"))
 PICTNART_LINK = os.getenv("BOT2_PICTNART_LINK", "https://pictnartcompany-ux.github.io/grow_your_craft/")
 PICTNART_LINES = [
     "Partner spotlight: Pictnart helps artists grow their craft 🚀 Check it out:",
@@ -48,11 +48,27 @@ def login() -> Client:
     c.login(HANDLE, APP_PASSWORD)
     return c
 
+# -------- Compat helpers (gèrent les deux signatures du SDK) --------
+def search_posts_compat(client: Client, q: str, limit: int = 30, sort: str = "latest"):
+    try:
+        # nouvelles versions
+        return client.app.bsky.feed.search_posts(q=q, limit=limit, sort=sort)
+    except TypeError:
+        # anciennes versions
+        return client.app.bsky.feed.search_posts(params={"q": q, "limit": limit, "sort": sort})
+
+def get_author_feed_compat(client: Client, actor: str, limit: int = 5):
+    try:
+        return client.app.bsky.feed.get_author_feed(actor=actor, limit=limit)
+    except TypeError:
+        return client.app.bsky.feed.get_author_feed(params={"actor": actor, "limit": limit})
+
+# ---------------- Logic ----------------
 def discover_and_engage(client: Client):
     liked = 0
     reposted = 0
-    res = client.app.bsky.feed.search_posts(q=QUERY, limit=30, sort="latest")
-    posts = list(res.posts or [])
+    res = search_posts_compat(client, QUERY, limit=30, sort="latest")
+    posts = list(getattr(res, "posts", []) or [])
     random.shuffle(posts)
     for post in posts:
         uri, cid = getattr(post, "uri", None), getattr(post, "cid", None)
@@ -89,8 +105,8 @@ def repost_from_sources(client: Client):
     reposted = 0
     for actor in SOURCE_HANDLES:
         try:
-            feed = client.app.bsky.feed.get_author_feed(actor=actor, limit=5)
-            for item in (feed.feed or []):
+            feed = get_author_feed_compat(client, actor=actor, limit=5)
+            for item in (getattr(feed, "feed", []) or []):
                 post = getattr(item, "post", None)
                 # Reposter uniquement des posts originaux (pas replies/reposts)
                 if not post or (post.reply is not None) or (post.repost is not None):
@@ -107,12 +123,11 @@ def repost_from_sources(client: Client):
             continue
 
 def maybe_pictnart_post(client: Client) -> bool:
-    """10% du temps, poste un message promo Pictnart (avec lien + emojis). Retourne True si posté."""
+    """10% du temps, poste Pictnart (lien + emojis). Retourne True si posté."""
     if random.random() >= PICTNART_WEIGHT:
         print("Skip Pictnart promo this run.")
         return False
     base = random.choice(PICTNART_LINES)
-    # Ajoute 1–2 emojis aléatoires à la fin
     emjs = " " + " ".join(random.sample(PICTNART_EMOJIS, k=random.choice([1, 2])))
     text = f"{base} {PICTNART_LINK}{emjs}"
     try:
@@ -140,14 +155,12 @@ def maybe_original_post(client: Client):
 if __name__ == "__main__":
     client = login()
 
-    # 1) Tentative de post Pictnart (10% par défaut)
+    # 1) Pictnart (~10%), sinon post original (~25%)
     did_pictnart = maybe_pictnart_post(client)
-
-    # 2) Si pas de post Pictnart cette fois, on tente un post original (25% par défaut)
     if not did_pictnart:
         maybe_original_post(client)
 
-    # 3) Ensuite, soit découverte/engage, soit repost depuis sources
+    # 2) Puis découverte/engage ou repost depuis sources
     if random.random() < DISCOVERY_WEIGHT:
         discover_and_engage(client)
     else:

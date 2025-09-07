@@ -2,10 +2,9 @@ import os
 import json
 import random
 import time
-import datetime as dt
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any, List
 
-from atproto import Client, models as M
+from atproto import Client, models as M, RichText
 
 STATE_FILE = "bot2_state.json"
 
@@ -17,14 +16,14 @@ if not HANDLE or not APP_PASSWORD:
 
 # --- Réglages sûrs (caps + delays) ---
 MAX_ENGAGEMENTS_PER_RUN = int(os.getenv("BOT2_MAX_ENG_PER_RUN", "3"))   # likes/réponses aux mentions
-MAX_REPOSTS_PER_RUN = int(os.getenv("BOT2_REPOST_LIMIT", "2"))          # <-- 2 pour ~deux retweets possibles par run
-DELAY_MIN_S = int(os.getenv("BOT2_DELAY_MIN_S", "12"))
-DELAY_MAX_S = int(os.getenv("BOT2_DELAY_MAX_S", "45"))
+MAX_REPOSTS_PER_RUN     = int(os.getenv("BOT2_REPOST_LIMIT", "2"))      # ← mets 2 pour viser ~2 retweets par run
+DELAY_MIN_S             = int(os.getenv("BOT2_DELAY_MIN_S", "12"))
+DELAY_MAX_S             = int(os.getenv("BOT2_DELAY_MAX_S", "45"))
 
 # --- Découverte (search) ---
-DISCOVERY_WEIGHT = float(os.getenv("BOT2_DISCOVERY_WEIGHT", "0.7"))     # probabilité d'activer la phase discovery
-DISCOVERY_QUERY = os.getenv("BOT2_QUERY", "art OR digital art OR nft")
-DISCOVERY_LIKE_LIMIT = int(os.getenv("BOT2_LIKE_LIMIT", "3"))           # nb max de likes via discovery
+DISCOVERY_WEIGHT   = float(os.getenv("BOT2_DISCOVERY_WEIGHT", "0.7"))   # proba d'activer la phase discovery
+DISCOVERY_QUERY    = os.getenv("BOT2_QUERY", "art OR digital art OR nft")
+DISCOVERY_LIKE_LIMIT = int(os.getenv("BOT2_LIKE_LIMIT", "3"))
 
 # --- Posts originaux (facultatif) ---
 DO_ORIGINAL_POST_WEIGHT = float(os.getenv("BOT2_ORIGINAL_POST_WEIGHT", "0.20"))  # 20% des runs
@@ -35,22 +34,22 @@ ORIGINAL_POSTS = [
     "Digital brushstrokes, narrative vibes.",
     "Sharing what I love: art, fiction, and a bit of NFTs.",
 ]
-LINK_SITE = os.getenv("BOT2_LINK_SITE", "https://louphi1987.github.io/Site_de_Louphi/")
-# On respecte exactement le lien que tu as fourni (version FR sur OpenSea)
+LINK_SITE    = os.getenv("BOT2_LINK_SITE", "https://louphi1987.github.io/Site_de_Louphi/")
 LINK_OPENSEA = os.getenv("BOT2_LINK_OPENSEA", "https://opensea.io/fr/collection/loufis-art")
 APPEND_LINK_PROB = float(os.getenv("BOT2_APPEND_LINK_PROB", "0.5"))
 
-# --- Sources explicites (opt-in) : une repost max/compte par run (hors discovery)
+# --- Sources explicites (opt-in) ---
 SOURCE_HANDLES = [h.strip() for h in os.getenv("BOT2_SOURCE_HANDLES", "").split(",") if h.strip()]
 
-# --- Compte à citer pour 50% des retweets ---
+# --- Compte et ratio pour retweets cités ---
 QUOTE_HANDLE = os.getenv("BOT2_QUOTE_HANDLE", "loufisart.bsky.social")
-QUOTE_SHARE = float(os.getenv("BOT2_QUOTE_SHARE", "0.5"))  # 50%
+QUOTE_SHARE  = float(os.getenv("BOT2_QUOTE_SHARE", "0.5"))  # 50%
 
 # --- State helpers ---
 def load_state() -> Dict[str, Any]:
     if os.path.exists(STATE_FILE):
         try:
+            import json
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
@@ -75,19 +74,15 @@ def get_author_feed_compat(client: Client, actor: str, limit: int = 5):
         return client.app.bsky.feed.get_author_feed(params={"actor": actor, "limit": limit})
 
 def search_posts_compat(client: Client, q: str, limit: int = 25):
-    """
-    Recherche de posts pour la découverte (selon la version du SDK).
-    """
     try:
         return client.app.bsky.feed.search_posts(q=q, limit=limit)
     except TypeError:
-        # Anciennes signatures
         try:
             return client.app.bsky.feed.search_posts(params={"q": q, "limit": limit})
         except Exception:
             return None
 
-# --- Core ---
+# --- Utils ---
 def login() -> Client:
     c = Client()
     c.login(HANDLE, APP_PASSWORD)
@@ -96,6 +91,16 @@ def login() -> Client:
 def random_sleep():
     time.sleep(random.uniform(DELAY_MIN_S, DELAY_MAX_S))
 
+def send_post_with_links(client: Client, text: str, embed=None, reply_to=None):
+    """
+    Envoie un post en détectant automatiquement les liens/handles/hashtags pour créer des 'facets'
+    -> garantit que l'URL est vraiment cliquable dans Bluesky.
+    """
+    rt = RichText(text)
+    rt.detect_facets()
+    return client.send_post(text=rt.text, facets=rt.facets, embed=embed, reply_to=reply_to)
+
+# --- Core ---
 def fetch_mentions_and_replies(client: Client, state: Dict[str, Any]) -> List[Any]:
     res = list_notifications_compat(client, limit=50)
     items = getattr(res, "notifications", []) or []
@@ -128,14 +133,11 @@ def safe_repost(client: Client, uri: str, cid: str) -> bool:
         return False
 
 def safe_quote_repost(client: Client, uri: str, cid: str, text: str) -> bool:
-    """
-    Retweet cité = nouveau post avec embed record pointant vers le post source.
-    """
     try:
         embed = M.AppBskyEmbedRecord.Main(
             record=M.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid)
         )
-        client.send_post(text=text, embed=embed)
+        send_post_with_links(client, text=text, embed=embed)
         return True
     except Exception as e:
         print(f"[quote err] {e}")
@@ -143,12 +145,10 @@ def safe_quote_repost(client: Client, uri: str, cid: str, text: str) -> bool:
 
 def safe_reply(client: Client, uri: str, cid: str, text: str) -> bool:
     try:
-        client.send_post(
-            text=text,
-            reply_to=M.AppBskyFeedPost.ReplyRef(
-                parent=M.AppBskyFeedPost.ReplyRefParent(uri=uri, cid=cid)
-            ),
+        reply_ref = M.AppBskyFeedPost.ReplyRef(
+            parent=M.AppBskyFeedPost.ReplyRefParent(uri=uri, cid=cid)
         )
+        send_post_with_links(client, text=text, reply_to=reply_ref)
         return True
     except Exception as e:
         print(f"[reply err] {e}")
@@ -165,7 +165,6 @@ def engage_opt_in(client: Client, state: Dict[str, Any]):
         cid = getattr(n, "cid", None)
         if not uri or not cid:
             continue
-        # 75% like, 25% petite réponse
         if random.random() < 0.75:
             if safe_like(client, uri, cid):
                 engagements += 1
@@ -176,7 +175,6 @@ def engage_opt_in(client: Client, state: Dict[str, Any]):
             if safe_reply(client, uri, cid, reply_text):
                 engagements += 1
                 print(f"Reply mention: {uri} -> {reply_text}")
-        # mark processed
         nid = getattr(n, "cid", None) or getattr(n, "id", None) or getattr(n, "uri", None)
         if nid:
             state.setdefault("processed_notifications", []).append(nid)
@@ -192,12 +190,12 @@ def maybe_original_post(client: Client):
     if random.random() < APPEND_LINK_PROB:
         text += " " + (LINK_SITE if random.random() < 0.5 else LINK_OPENSEA)
     try:
-        resp = client.send_post(text=text)
+        resp = send_post_with_links(client, text=text)
         print(f"Original post: {text} -> {getattr(resp, 'uri', '')}")
     except Exception as e:
         print(f"[post err] {e}")
 
-# --- Textes pour retweets cités (anglais, multi-phrases courtes + emoji + lien cliquable) ---
+# --- Templates quote-retweets ---
 QUOTE_TEMPLATES = [
     "New artist to discover ✨\nFresh vibes and bold colors.\nExplore the collection: {link}",
     "A unique voice in digital art 🎨\nStorytelling through pixels.\nDiscover more: {link}",
@@ -207,20 +205,15 @@ QUOTE_TEMPLATES = [
 ]
 
 def build_quote_text() -> str:
-    t = random.choice(QUOTE_TEMPLATES)
-    return t.format(link=LINK_OPENSEA)
+    return random.choice(QUOTE_TEMPLATES).format(link=LINK_OPENSEA)
 
 def pick_latest_original_post_from_actor(client: Client, actor: str, limit: int = 10):
-    """
-    Récupère le dernier post original (ni reply, ni repost) d'un acteur.
-    """
     try:
         feed = get_author_feed_compat(client, actor=actor, limit=limit)
         for item in (getattr(feed, "feed", []) or []):
             post = getattr(item, "post", None)
             if not post:
                 continue
-            # Exclure replies/reposts
             if (getattr(post, "reply", None) is not None) or (getattr(post, "repost", None) is not None):
                 continue
             return post
@@ -229,11 +222,6 @@ def pick_latest_original_post_from_actor(client: Client, actor: str, limit: int 
     return None
 
 def repost_from_sources_with_quotes(client: Client):
-    """
-    Gère TOUTES les reposts du run, en appliquant la contrainte :
-    - ~50% des retweets = retweets cités du compte QUOTE_HANDLE, avec texte anglais + emoji + lien OpenSea
-    - le reste = reposts simples issus des SOURCE_HANDLES (opt-in) ou, à défaut, d'une découverte
-    """
     if MAX_REPOSTS_PER_RUN <= 0:
         print("Repost cap is 0. Skipping reposts.")
         return
@@ -248,8 +236,7 @@ def repost_from_sources_with_quotes(client: Client):
         if not p:
             print("No original post found to quote from QUOTE_HANDLE.")
             break
-        ok = safe_quote_repost(client, p.uri, p.cid, build_quote_text())
-        if ok:
+        if safe_quote_repost(client, p.uri, p.cid, build_quote_text()):
             done_quotes += 1
             done_reposts += 1
             print(f"Quote-retweet from @{QUOTE_HANDLE}: {p.uri}")
@@ -257,7 +244,7 @@ def repost_from_sources_with_quotes(client: Client):
         else:
             break
 
-    # 2) Reposts simples depuis SOURCE_HANDLES (hors QUOTE_HANDLE pour éviter doublons)
+    # 2) Reposts simples depuis SOURCE_HANDLES (hors QUOTE_HANDLE)
     sources = [h for h in SOURCE_HANDLES if h and h != QUOTE_HANDLE]
     random.shuffle(sources)
     for actor in sources:
@@ -278,7 +265,7 @@ def repost_from_sources_with_quotes(client: Client):
             print(f"[source err:{actor}] {e}")
             continue
 
-    # 3) Si on n'a pas atteint le quota de reposts, on tente via discovery (repost simple)
+    # 3) Compléter via discovery si besoin
     if done_reposts < MAX_REPOSTS_PER_RUN:
         remaining = MAX_REPOSTS_PER_RUN - done_reposts
         extra = repost_via_discovery(client, remaining)
@@ -287,9 +274,6 @@ def repost_from_sources_with_quotes(client: Client):
     print(f"Reposts done: {done_reposts} (quotes={done_quotes}, cap={MAX_REPOSTS_PER_RUN})")
 
 def repost_via_discovery(client: Client, remaining_needed: int) -> int:
-    """
-    Reposts simples issus d'une recherche si besoin pour compléter le quota.
-    """
     if remaining_needed <= 0:
         return 0
     try:
@@ -300,9 +284,6 @@ def repost_via_discovery(client: Client, remaining_needed: int) -> int:
         for p in posts:
             if count >= remaining_needed:
                 break
-            # Exclure reply/repost si champs présents (search_posts renvoie des AppBskyFeedDefs.PostView)
-            # On vérifie prudemment selon structure du SDK.
-            # Si ces attributs n'existent pas, on tente quand même.
             try:
                 if getattr(p, "reply", None) is not None or getattr(p, "repost", None) is not None:
                     continue
@@ -317,21 +298,14 @@ def repost_via_discovery(client: Client, remaining_needed: int) -> int:
         print(f"[discovery repost err] {e}")
         return 0
 
-def discovery_likes_and_maybe_reposts(client: Client):
-    """
-    Phase découverte (activée avec probabilité DISCOVERY_WEIGHT) :
-    - Likes jusqu'à DISCOVERY_LIKE_LIMIT
-    - Reposts sont gérés par repost_from_sources_with_quotes() pour respecter le 50% cités.
-    """
+def discovery_likes(client: Client):
     if random.random() >= DISCOVERY_WEIGHT:
         print("Skip discovery this run (weight check).")
         return
-
     try:
         res = search_posts_compat(client, q=DISCOVERY_QUERY, limit=40)
         posts = getattr(res, "posts", []) or []
         random.shuffle(posts)
-
         likes_done = 0
         for p in posts:
             if likes_done >= DISCOVERY_LIKE_LIMIT:
@@ -344,26 +318,25 @@ def discovery_likes_and_maybe_reposts(client: Client):
                 likes_done += 1
                 print(f"Discovery like: {uri}")
                 random_sleep()
-
         print(f"Discovery likes done: {likes_done}/{DISCOVERY_LIKE_LIMIT}")
-
     except Exception as e:
         print(f"[discovery err] {e}")
 
+# --- Main ---
 if __name__ == "__main__":
     client = login()
 
-    # 1) Engagements opt-in (mentions/réponses) – prioritaire
+    # 1) Engagements opt-in (mentions/réponses)
     state = load_state()
     engage_opt_in(client, state)
 
     # 2) Occasionnellement, un post original
     maybe_original_post(client)
 
-    # 3) Découverte (likes) selon poids
-    discovery_likes_and_maybe_reposts(client)
+    # 3) Découverte (likes)
+    discovery_likes(client)
 
-    # 4) Reposts (incluant 50% de quote-retweets sur @loufisart)
+    # 4) Reposts (dont 50% de quote-retweets depuis @loufisart)
     repost_from_sources_with_quotes(client)
 
     print("Bot2 run completed (anti-spam mode).")

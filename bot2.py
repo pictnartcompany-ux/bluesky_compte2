@@ -1,3 +1,11 @@
+# bot2_creative.py  —  Bluesky Bot 2 (Art-focused discovery)
+# - Rotation de requêtes
+# - Scoring pro-œuvres (images + marketplaces)
+# - Pénalités articles / threads
+# - Diversité (évite répétitions d’auteurs/domaines)
+# - Cooldown par auteur/domaine
+# - 50% de quote-retweets configurables
+
 import os
 import json
 import random
@@ -17,14 +25,45 @@ if not HANDLE or not APP_PASSWORD:
 
 # --- Réglages sûrs (caps + delays) ---
 MAX_ENGAGEMENTS_PER_RUN = int(os.getenv("BOT2_MAX_ENG_PER_RUN", "3"))   # likes/réponses aux mentions
-MAX_REPOSTS_PER_RUN = int(os.getenv("BOT2_REPOST_LIMIT", "2"))          # <-- 2 pour ~deux retweets possibles par run
+MAX_REPOSTS_PER_RUN = int(os.getenv("BOT2_REPOST_LIMIT", "2"))          # ~2 reposts possibles par run
 DELAY_MIN_S = int(os.getenv("BOT2_DELAY_MIN_S", "12"))
 DELAY_MAX_S = int(os.getenv("BOT2_DELAY_MAX_S", "45"))
 
+# --- Diversité / Cooldown ---
+COOLDOWN_DAYS = int(os.getenv("BOT2_SOURCE_COOLDOWN_DAYS", "3"))
+
 # --- Découverte (search) ---
-DISCOVERY_WEIGHT = float(os.getenv("BOT2_DISCOVERY_WEIGHT", "0.7"))     # probabilité d'activer la phase discovery
-DISCOVERY_QUERY = os.getenv("BOT2_QUERY", "art OR digital art OR nft")
-DISCOVERY_LIKE_LIMIT = int(os.getenv("BOT2_LIKE_LIMIT", "3"))           # nb max de likes via discovery
+# Choix 1 : passer un seul BOT2_QUERY (héritage)
+LEGACY_QUERY = os.getenv("BOT2_QUERY", "").strip()
+# Choix 2 : passer une liste via BOT2_QUERIES séparée par |
+QUERIES_ENV = os.getenv("BOT2_QUERIES", "").split("|") if os.getenv("BOT2_QUERIES") else []
+
+DEFAULT_QUERIES = [
+    # NFT / cryptoart (EN)
+    "nft art OR #nftart OR cryptoart OR #cryptoart",
+    "#nft drop OR 1/1 art OR #oneofone",
+    "digital art #nft OR generative art OR #genart",
+    # Marketplaces noms
+    "zora OR foundation OR superrare OR manifold OR opensea",
+    # Tezos / fxhash
+    "tezos art OR #tezos OR fxhash",
+    # FR
+    "art numérique #nft OR cryptoart #art",
+]
+
+def _build_queries() -> List[str]:
+    if QUERIES_ENV and any(q.strip() for q in QUERIES_ENV):
+        return [q.strip() for q in QUERIES_ENV if q.strip()]
+    if LEGACY_QUERY:
+        return [LEGACY_QUERY]
+    return DEFAULT_QUERIES[:]
+
+DISCOVERY_LIKE_LIMIT = int(os.getenv("BOT2_LIKE_LIMIT", "3"))  # nb max de likes via discovery
+DISCOVERY_WEIGHT = float(os.getenv("BOT2_DISCOVERY_WEIGHT", "0.7"))  # prob d’activer la phase discovery
+
+def pick_discovery_query() -> str:
+    queries = _build_queries()
+    return random.choice(queries)
 
 # --- Posts originaux (facultatif) ---
 DO_ORIGINAL_POST_WEIGHT = float(os.getenv("BOT2_ORIGINAL_POST_WEIGHT", "0.20"))  # 20% des runs
@@ -36,26 +75,52 @@ ORIGINAL_POSTS = [
     "Sharing what I love: art, fiction, and a bit of NFTs.",
 ]
 LINK_SITE = os.getenv("BOT2_LINK_SITE", "https://louphi1987.github.io/Site_de_Louphi/")
-# On respecte exactement le lien que tu as fourni (version FR sur OpenSea)
 LINK_OPENSEA = os.getenv("BOT2_LINK_OPENSEA", "https://opensea.io/fr/collection/loufis-art")
 APPEND_LINK_PROB = float(os.getenv("BOT2_APPEND_LINK_PROB", "0.5"))
 
-# --- Sources explicites (opt-in) : une repost max/compte par run (hors discovery)
+# --- Sources explicites (opt-in) ---
 SOURCE_HANDLES = [h.strip() for h in os.getenv("BOT2_SOURCE_HANDLES", "").split(",") if h.strip()]
 
-# --- Compte à citer pour 50% des retweets ---
+# --- Compte à citer pour X% des retweets ---
 QUOTE_HANDLE = os.getenv("BOT2_QUOTE_HANDLE", "loufisart.bsky.social")
 QUOTE_SHARE = float(os.getenv("BOT2_QUOTE_SHARE", "0.5"))  # 50%
+
+# --- Heuristiques "art vs article" ---
+MARKET_DOMAINS = set(
+    d.strip() for d in os.getenv(
+        "BOT2_MARKET_DOMAINS",
+        "opensea.io,foundation.app,superrare.com,zora.co,manifold.xyz,objkt.com,fxhash.xyz,teia.art,versum.xyz,rarible.com"
+    ).split(",") if d.strip()
+)
+ARTICLE_DOMAINS = set(
+    d.strip() for d in os.getenv(
+        "BOT2_ARTICLE_DOMAINS",
+        "medium.com,substack.com,mirror.xyz,blog,news"
+    ).split(",") if d.strip()
+)
+KEYWORDS_GOOD = {
+    "nft","nftart","cryptoart","genart","generative","mint","drop","1/1","oneofone",
+    "tezos","fxhash","manifold","zora","opensea","foundation","superrare"
+}
+KEYWORDS_BAD = {"article","news","thread","analysis","opinion","market report"}
 
 # --- State helpers ---
 def load_state() -> Dict[str, Any]:
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                s = json.load(f)
+                s.setdefault("processed_notifications", [])
+                s.setdefault("recent_sources", [])  # [{actor, ts}]
+                s.setdefault("recent_domains", [])  # [{domain, ts}]
+                return s
         except Exception:
             pass
-    return {"processed_notifications": []}
+    return {
+        "processed_notifications": [],
+        "recent_sources": [],
+        "recent_domains": [],
+    }
 
 def save_state(state: Dict[str, Any]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -75,13 +140,9 @@ def get_author_feed_compat(client: Client, actor: str, limit: int = 5):
         return client.app.bsky.feed.get_author_feed(params={"actor": actor, "limit": limit})
 
 def search_posts_compat(client: Client, q: str, limit: int = 25):
-    """
-    Recherche de posts pour la découverte (selon la version du SDK).
-    """
     try:
         return client.app.bsky.feed.search_posts(q=q, limit=limit)
     except TypeError:
-        # Anciennes signatures
         try:
             return client.app.bsky.feed.search_posts(params={"q": q, "limit": limit})
         except Exception:
@@ -128,9 +189,6 @@ def safe_repost(client: Client, uri: str, cid: str) -> bool:
         return False
 
 def safe_quote_repost(client: Client, uri: str, cid: str, text: str) -> bool:
-    """
-    Retweet cité = nouveau post avec embed record pointant vers le post source.
-    """
     try:
         embed = M.AppBskyEmbedRecord.Main(
             record=M.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid)
@@ -176,7 +234,6 @@ def engage_opt_in(client: Client, state: Dict[str, Any]):
             if safe_reply(client, uri, cid, reply_text):
                 engagements += 1
                 print(f"Reply mention: {uri} -> {reply_text}")
-        # mark processed
         nid = getattr(n, "cid", None) or getattr(n, "id", None) or getattr(n, "uri", None)
         if nid:
             state.setdefault("processed_notifications", []).append(nid)
@@ -197,7 +254,7 @@ def maybe_original_post(client: Client):
     except Exception as e:
         print(f"[post err] {e}")
 
-# --- Textes pour retweets cités (anglais, multi-phrases courtes + emoji + lien cliquable) ---
+# --- Quote templates ---
 QUOTE_TEMPLATES = [
     "New artist to discover ✨\nFresh vibes and bold colors.\nExplore the collection: {link}",
     "A unique voice in digital art 🎨\nStorytelling through pixels.\nDiscover more: {link}",
@@ -205,22 +262,118 @@ QUOTE_TEMPLATES = [
     "Clean lines, vivid worlds.\nOne more artist to watch 👀\nSee the works: {link}",
     "New drops + timeless style.\nCurated for curious eyes 🧭\nStart here: {link}",
 ]
-
 def build_quote_text() -> str:
-    t = random.choice(QUOTE_TEMPLATES)
-    return t.format(link=LINK_OPENSEA)
+    return random.choice(QUOTE_TEMPLATES).format(link=LINK_OPENSEA)
 
+# --- Helpers "art vs article" + diversité ---
+def _get_embed(p):
+    try:
+        return getattr(p, "embed", None)
+    except Exception:
+        return None
+
+def _extract_domains_from_post(p) -> List[str]:
+    domains = []
+    e = _get_embed(p)
+    try:
+        # External link
+        if e and getattr(e, "$type", "").endswith("embed.external#view"):
+            uri = getattr(getattr(e, "external", None), "uri", "") or ""
+            if "://" in uri:
+                domains.append(uri.split("://",1)[1].split("/",1)[0].lower())
+        # Record-with-media (quoted link)
+        if e and getattr(e, "$type", "").endswith("embed.recordWithMedia#view"):
+            media = getattr(e, "media", None)
+            if media and getattr(media, "$type", "").endswith("embed.external#view"):
+                uri = getattr(getattr(media, "external", None), "uri", "") or ""
+                if "://" in uri:
+                    domains.append(uri.split("://",1)[1].split("/",1)[0].lower())
+    except Exception:
+        pass
+    return domains
+
+def _has_image_embed(p) -> bool:
+    e = _get_embed(p)
+    try:
+        if e and getattr(e, "$type", "").endswith("embed.images#view"):
+            imgs = getattr(e, "images", []) or []
+            return len(imgs) > 0
+        if e and getattr(e, "$type", "").endswith("embed.recordWithMedia#view"):
+            media = getattr(e, "media", None)
+            if media and getattr(media, "$type", "").endswith("embed.images#view"):
+                imgs = getattr(media, "images", []) or []
+                return len(imgs) > 0
+    except Exception:
+        pass
+    return False
+
+def _text_of(p) -> str:
+    try:
+        rec = getattr(p, "record", None)
+        return (getattr(rec, "text", None) or "").lower()
+    except Exception:
+        return ""
+
+def score_post_for_art(p) -> int:
+    score = 0
+    if _has_image_embed(p):
+        score += 5
+    domains = _extract_domains_from_post(p)
+    if any(any(md in d for md in MARKET_DOMAINS) for d in domains):
+        score += 4
+    if any(any(ad in d for ad in ARTICLE_DOMAINS) for d in domains):
+        score -= 3
+    t = _text_of(p)
+    if any(k in t for k in KEYWORDS_GOOD):
+        score += 2
+    if any(k in t for k in KEYWORDS_BAD):
+        score -= 2
+    try:
+        if getattr(p, "reply", None) is not None or getattr(p, "repost", None) is not None:
+            score -= 2
+    except Exception:
+        pass
+    return score
+
+def _actor_of(p) -> str:
+    try:
+        a = getattr(p, "author", None)
+        return getattr(a, "handle", "") or ""
+    except Exception:
+        return ""
+
+def _is_cooled(entries: List[Dict[str, str]], key: str, value: str) -> bool:
+    if not value:
+        return True
+    try:
+        cutoff = dt.date.today() - dt.timedelta(days=COOLDOWN_DAYS)
+        for it in reversed(entries):
+            if it.get(key) == value:
+                when = dt.date.fromisoformat(it.get("ts", "1970-01-01"))
+                if when >= cutoff:
+                    return False
+    except Exception:
+        pass
+    return True
+
+def _record_source_and_domain(state: Dict[str, Any], actor: str, domains: List[str]) -> None:
+    if actor:
+        state.setdefault("recent_sources", []).append({"actor": actor, "ts": dt.date.today().isoformat()})
+        state["recent_sources"] = state["recent_sources"][-200:]
+    if domains:
+        d = domains[0]
+        state.setdefault("recent_domains", []).append({"domain": d, "ts": dt.date.today().isoformat()})
+        state["recent_domains"] = state["recent_domains"][-200:]
+    save_state(state)
+
+# --- Sélection posts d'un acteur (original only) ---
 def pick_latest_original_post_from_actor(client: Client, actor: str, limit: int = 10):
-    """
-    Récupère le dernier post original (ni reply, ni repost) d'un acteur.
-    """
     try:
         feed = get_author_feed_compat(client, actor=actor, limit=limit)
         for item in (getattr(feed, "feed", []) or []):
             post = getattr(item, "post", None)
             if not post:
                 continue
-            # Exclure replies/reposts
             if (getattr(post, "reply", None) is not None) or (getattr(post, "repost", None) is not None):
                 continue
             return post
@@ -228,12 +381,8 @@ def pick_latest_original_post_from_actor(client: Client, actor: str, limit: int 
         print(f"[pick original err:{actor}] {e}")
     return None
 
-def repost_from_sources_with_quotes(client: Client):
-    """
-    Gère TOUTES les reposts du run, en appliquant la contrainte :
-    - ~50% des retweets = retweets cités du compte QUOTE_HANDLE, avec texte anglais + emoji + lien OpenSea
-    - le reste = reposts simples issus des SOURCE_HANDLES (opt-in) ou, à défaut, d'une découverte
-    """
+# --- Reposts avec logique de diversité + quotes ---
+def repost_from_sources_with_quotes(client: Client, state: Dict[str, Any]):
     if MAX_REPOSTS_PER_RUN <= 0:
         print("Repost cap is 0. Skipping reposts.")
         return
@@ -248,16 +397,25 @@ def repost_from_sources_with_quotes(client: Client):
         if not p:
             print("No original post found to quote from QUOTE_HANDLE.")
             break
+        actor = _actor_of(p)
+        domains = _extract_domains_from_post(p)
+        dom_key = domains[0] if domains else ""
+        if not _is_cooled(state.get("recent_sources", []), "actor", actor):  # respect cooldown
+            break
+        if dom_key and not _is_cooled(state.get("recent_domains", []), "domain", dom_key):
+            break
+
         ok = safe_quote_repost(client, p.uri, p.cid, build_quote_text())
         if ok:
             done_quotes += 1
             done_reposts += 1
             print(f"Quote-retweet from @{QUOTE_HANDLE}: {p.uri}")
+            _record_source_and_domain(state, actor, domains)
             random_sleep()
         else:
             break
 
-    # 2) Reposts simples depuis SOURCE_HANDLES (hors QUOTE_HANDLE pour éviter doublons)
+    # 2) Reposts simples depuis SOURCE_HANDLES (hors QUOTE_HANDLE)
     sources = [h for h in SOURCE_HANDLES if h and h != QUOTE_HANDLE]
     random.shuffle(sources)
     for actor in sources:
@@ -269,48 +427,79 @@ def repost_from_sources_with_quotes(client: Client):
                 post = getattr(item, "post", None)
                 if not post or (post.reply is not None) or (post.repost is not None):
                     continue
+                domains = _extract_domains_from_post(post)
+                dom_key = domains[0] if domains else ""
+                if not _is_cooled(state.get("recent_sources", []), "actor", actor):
+                    continue
+                if dom_key and not _is_cooled(state.get("recent_domains", []), "domain", dom_key):
+                    continue
+                # Optionnel: exiger un minimum de score (si le post a une image par ex.)
+                if score_post_for_art(post) < 1:
+                    continue
+
                 if safe_repost(client, post.uri, post.cid):
                     done_reposts += 1
                     print(f"Repost (simple) from {actor}: {post.uri}")
+                    _record_source_and_domain(state, actor, domains)
                     random_sleep()
                     break
         except Exception as e:
             print(f"[source err:{actor}] {e}")
             continue
 
-    # 3) Si on n'a pas atteint le quota de reposts, on tente via discovery (repost simple)
+    # 3) Complément via discovery (repost simple) avec tri par score + diversité
     if done_reposts < MAX_REPOSTS_PER_RUN:
         remaining = MAX_REPOSTS_PER_RUN - done_reposts
-        extra = repost_via_discovery(client, remaining)
+        extra = repost_via_discovery(client, state, remaining)
         done_reposts += extra
 
     print(f"Reposts done: {done_reposts} (quotes={done_quotes}, cap={MAX_REPOSTS_PER_RUN})")
 
-def repost_via_discovery(client: Client, remaining_needed: int) -> int:
-    """
-    Reposts simples issus d'une recherche si besoin pour compléter le quota.
-    """
+def repost_via_discovery(client: Client, state: Dict[str, Any], remaining_needed: int) -> int:
     if remaining_needed <= 0:
         return 0
     try:
-        res = search_posts_compat(client, q=DISCOVERY_QUERY, limit=30)
+        q = pick_discovery_query()
+        res = search_posts_compat(client, q=q, limit=40)
         posts = getattr(res, "posts", []) or []
-        random.shuffle(posts)
+        # tri par score décroissant
+        scored = sorted(posts, key=score_post_for_art, reverse=True)
+
+        used_authors, used_domains = set(), set()
         count = 0
-        for p in posts:
+        for p in scored:
             if count >= remaining_needed:
                 break
-            # Exclure reply/repost si champs présents (search_posts renvoie des AppBskyFeedDefs.PostView)
-            # On vérifie prudemment selon structure du SDK.
-            # Si ces attributs n'existent pas, on tente quand même.
-            try:
-                if getattr(p, "reply", None) is not None or getattr(p, "repost", None) is not None:
-                    continue
-            except Exception:
-                pass
-            if safe_repost(client, p.uri, p.cid):
+            uri = getattr(p, "uri", None); cid = getattr(p, "cid", None)
+            if not uri or not cid:
+                continue
+
+            actor = _actor_of(p)
+            domains = _extract_domains_from_post(p)
+            dom_key = domains[0] if domains else ""
+
+            # diversité instantanée
+            if actor in used_authors:
+                continue
+            if dom_key and dom_key in used_domains:
+                continue
+
+            # respect cooldown global
+            if not _is_cooled(state.get("recent_sources", []), "actor", actor):
+                continue
+            if dom_key and not _is_cooled(state.get("recent_domains", []), "domain", dom_key):
+                continue
+
+            # seuil minimal pour éviter les articles / threads
+            if score_post_for_art(p) < 2:
+                continue
+
+            if safe_repost(client, uri, cid):
                 count += 1
-                print(f"Repost via discovery: {p.uri}")
+                used_authors.add(actor)
+                if dom_key: used_domains.add(dom_key)
+                print(f"Repost via discovery (art-score ok): {uri}")
+                _record_source_and_domain(state, actor, domains)
                 random_sleep()
         return count
     except Exception as e:
@@ -318,17 +507,12 @@ def repost_via_discovery(client: Client, remaining_needed: int) -> int:
         return 0
 
 def discovery_likes_and_maybe_reposts(client: Client):
-    """
-    Phase découverte (activée avec probabilité DISCOVERY_WEIGHT) :
-    - Likes jusqu'à DISCOVERY_LIKE_LIMIT
-    - Reposts sont gérés par repost_from_sources_with_quotes() pour respecter le 50% cités.
-    """
     if random.random() >= DISCOVERY_WEIGHT:
         print("Skip discovery this run (weight check).")
         return
-
     try:
-        res = search_posts_compat(client, q=DISCOVERY_QUERY, limit=40)
+        q = pick_discovery_query()
+        res = search_posts_compat(client, q=q, limit=40)
         posts = getattr(res, "posts", []) or []
         random.shuffle(posts)
 
@@ -344,16 +528,15 @@ def discovery_likes_and_maybe_reposts(client: Client):
                 likes_done += 1
                 print(f"Discovery like: {uri}")
                 random_sleep()
-
         print(f"Discovery likes done: {likes_done}/{DISCOVERY_LIKE_LIMIT}")
-
     except Exception as e:
         print(f"[discovery err] {e}")
 
+# --- MAIN ---
 if __name__ == "__main__":
     client = login()
 
-    # 1) Engagements opt-in (mentions/réponses) – prioritaire
+    # 1) Engagements opt-in (mentions/réponses)
     state = load_state()
     engage_opt_in(client, state)
 
@@ -363,7 +546,7 @@ if __name__ == "__main__":
     # 3) Découverte (likes) selon poids
     discovery_likes_and_maybe_reposts(client)
 
-    # 4) Reposts (incluant 50% de quote-retweets sur @loufisart)
-    repost_from_sources_with_quotes(client)
+    # 4) Reposts (incluant X% de quote-retweets)
+    repost_from_sources_with_quotes(client, state)
 
-    print("Bot2 run completed (anti-spam mode).")
+    print("Bot2 run completed (creative mode).")

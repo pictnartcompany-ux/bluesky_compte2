@@ -1,11 +1,9 @@
-# bot2_creative.py  —  Bluesky Bot 2 (Art-focused discovery, safe quotes)
-# - Rotation de requêtes
-# - Scoring pro-œuvres (images + marketplaces)
-# - Pénalités articles / threads
-# - Diversité (évite répétitions d’auteurs/domaines)
-# - Cooldown par auteur/domaine
-# - Quote-retweet **UNIQUEMENT** pour les posts originaux du QUOTE_HANDLE (compte 1)
-# - Tous les autres = repost simple
+# bot2.py — Bluesky Bot 2 (Art-focused discovery, safe quotes)
+# - Fenêtre horaire stricte: 19:00–23:00 Europe/Brussels (soir uniquement)
+# - Nuit silencieuse: 23:00–07:00 (aucune action)
+# - Diversité + cooldown par source/domaine + anti-doublon d'URI
+# - Reposts "simples" depuis sources; quotes STRICTEMENT depuis QUOTE_HANDLE (post original)
+# - Activité ajustable via variables d'env (caps, délais, poids discovery)
 
 import os
 import json
@@ -16,7 +14,32 @@ from typing import Dict, Any, List
 
 from atproto import Client, models as M
 
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    from backports.zoneinfo import ZoneInfo  # type: ignore
+
 STATE_FILE = "bot2_state.json"
+
+# --- Time window (Europe/Brussels) ---
+TIMEZONE = "Europe/Brussels"
+EVENING_START = 19  # 19:00 inclus
+EVENING_END   = 23  # 23:00 exclu
+QUIET_START   = 23  # nuit 23:00
+QUIET_END     = 7   # -> 07:00
+
+def _now_local():
+    return dt.datetime.now(ZoneInfo(TIMEZONE))
+
+def _is_evening(now_local: dt.datetime) -> bool:
+    return EVENING_START <= now_local.hour < EVENING_END
+
+def _is_quiet(now_local: dt.datetime) -> bool:
+    h = now_local.hour
+    if QUIET_START <= QUIET_END:
+        return QUIET_START <= h < QUIET_END
+    # cas wrap
+    return h >= QUIET_START or h < QUIET_END
 
 # --- Secrets GitHub ---
 HANDLE = os.getenv("BSKY2_HANDLE")
@@ -30,7 +53,10 @@ MAX_REPOSTS_PER_RUN     = int(os.getenv("BOT2_REPOST_LIMIT", "2"))      # ~2 rep
 DELAY_MIN_S             = int(os.getenv("BOT2_DELAY_MIN_S", "12"))
 DELAY_MAX_S             = int(os.getenv("BOT2_DELAY_MAX_S", "45"))
 
-# --- Diversité / Cooldown ---
+# --- Anti-doublon d'URI (durée) ---
+POST_COOLDOWN_DAYS = int(os.getenv("BOT2_POST_COOLDOWN_DAYS", "14"))
+
+# --- Diversité / Cooldown par source/domaine ---
 COOLDOWN_DAYS = int(os.getenv("BOT2_SOURCE_COOLDOWN_DAYS", "3"))
 
 # --- Découverte (search) ---
@@ -108,6 +134,7 @@ def load_state() -> Dict[str, Any]:
                 s.setdefault("processed_notifications", [])
                 s.setdefault("recent_sources", [])  # [{actor, ts}]
                 s.setdefault("recent_domains", [])  # [{domain, ts}]
+                s.setdefault("recent_posts", [])    # [{uri, ts}]
                 return s
         except Exception:
             pass
@@ -115,6 +142,7 @@ def load_state() -> Dict[str, Any]:
         "processed_notifications": [],
         "recent_sources": [],
         "recent_domains": [],
+        "recent_posts": [],
     }
 
 def save_state(state: Dict[str, Any]) -> None:
@@ -184,7 +212,7 @@ def safe_repost(client: Client, uri: str, cid: str) -> bool:
         return False
 
 def safe_quote_repost(client: Client, uri: str, cid: str, text: str) -> bool:
-    # Utilisé EXCLUSIVEMENT pour QUOTE_HANDLE (compte 1) + post original (cf. garde-fous plus bas)
+    # Utilisé EXCLUSIVEMENT pour QUOTE_HANDLE (compte 1) + post original
     try:
         embed = M.AppBskyEmbedRecord.Main(
             record=M.ComAtprotoRepoStrongRef.Main(uri=uri, cid=cid)
@@ -208,46 +236,52 @@ def safe_reply(client: Client, uri: str, cid: str, text: str) -> bool:
         print(f"[reply err] {e}")
         return False
 
-def engage_opt_in(client: Client, state: Dict[str, Any]):
-    mentions = fetch_mentions_and_replies(client, state)
-    random.shuffle(mentions)
-    engagements = 0
-    for n in mentions:
-        if engagements >= MAX_ENGAGEMENTS_PER_RUN:
-            break
-        uri = getattr(n, "uri", None)
-        cid = getattr(n, "cid", None)
-        if not uri or not cid:
-            continue
-        if random.random() < 0.75:
-            if safe_like(client, uri, cid):
-                engagements += 1
-                print(f"Like mention: {uri}")
-        else:
-            reply_text = random.choice(["Thanks!", "Appreciate it 🙏", "Thanks for the tag ✨"]) \
-                         if random.random() < 0.7 else random.choice(["✨", "👏", "👍"])
-            if safe_reply(client, uri, cid, reply_text):
-                engagements += 1
-                print(f"Reply mention: {uri} -> {reply_text}")
-        nid = getattr(n, "cid", None) or getattr(n, "id", None) or getattr(n, "uri", None)
-        if nid:
-            state.setdefault("processed_notifications", []).append(nid)
-            state["processed_notifications"] = state["processed_notifications"][-500:]
-            save_state(state)
-        random_sleep()
-
-def maybe_original_post(client: Client):
-    if random.random() >= DO_ORIGINAL_POST_WEIGHT:
-        print("Skip original post this run.")
-        return
-    text = random.choice(ORIGINAL_POSTS)
-    if random.random() < APPEND_LINK_PROB:
-        text += " " + (LINK_SITE if random.random() < 0.5 else LINK_OPENSEA)
+# --- Anti-doublons URI ---
+def _uri_recent(state: Dict[str, Any], uri: str) -> bool:
+    if not uri:
+        return True
     try:
-        resp = client.send_post(text=text)
-        print(f"Original post: {text} -> {getattr(resp, 'uri', '')}")
-    except Exception as e:
-        print(f"[post err] {e}")
+        cutoff = dt.date.today() - dt.timedelta(days=POST_COOLDOWN_DAYS)
+        for it in reversed(state.get("recent_posts", [])):
+            if it.get("uri") == uri:
+                when = dt.date.fromisoformat(it.get("ts", "1970-01-01"))
+                if when >= cutoff:
+                    return True
+    except Exception:
+        pass
+    return False
+
+def _remember_uri(state: Dict[str, Any], uri: str) -> None:
+    if not uri:
+        return
+    state.setdefault("recent_posts", []).append({"uri": uri, "ts": dt.date.today().isoformat()})
+    state["recent_posts"] = state["recent_posts"][-500:]
+    save_state(state)
+
+# --- Diversité / cooldown source & domaine ---
+def _is_cooled(entries: List[Dict[str, str]], key: str, value: str) -> bool:
+    if not value:
+        return True
+    try:
+        cutoff = dt.date.today() - dt.timedelta(days=COOLDOWN_DAYS)
+        for it in reversed(entries):
+            if it.get(key) == value:
+                when = dt.date.fromisoformat(it.get("ts", "1970-01-01"))
+                if when >= cutoff:
+                    return False
+    except Exception:
+        pass
+    return True
+
+def _record_source_and_domain(state: Dict[str, Any], actor: str, domains: List[str]) -> None:
+    if actor:
+        state.setdefault("recent_sources", []).append({"actor": actor, "ts": dt.date.today().isoformat()})
+        state["recent_sources"] = state["recent_sources"][-200:]
+    if domains:
+        d = domains[0]
+        state.setdefault("recent_domains", []).append({"domain": d, "ts": dt.date.today().isoformat()})
+        state["recent_domains"] = state["recent_domains"][-200:]
+    save_state(state)
 
 # --- Quote templates (uniquement pour QUOTE_HANDLE) ---
 QUOTE_TEMPLATES = [
@@ -260,7 +294,7 @@ QUOTE_TEMPLATES = [
 def build_quote_text() -> str:
     return random.choice(QUOTE_TEMPLATES).format(link=LINK_OPENSEA)
 
-# --- Helpers "art vs article" + diversité ---
+# --- Helpers "art vs article" + util ---
 def _get_embed(p):
     try:
         return getattr(p, "embed", None)
@@ -335,31 +369,6 @@ def _actor_of(p) -> str:
     except Exception:
         return ""
 
-def _is_cooled(entries: List[Dict[str, str]], key: str, value: str) -> bool:
-    if not value:
-        return True
-    try:
-        cutoff = dt.date.today() - dt.timedelta(days=COOLDOWN_DAYS)
-        for it in reversed(entries):
-            if it.get(key) == value:
-                when = dt.date.fromisoformat(it.get("ts", "1970-01-01"))
-                if when >= cutoff:
-                    return False
-    except Exception:
-        pass
-    return True
-
-def _record_source_and_domain(state: Dict[str, Any], actor: str, domains: List[str]) -> None:
-    if actor:
-        state.setdefault("recent_sources", []).append({"actor": actor, "ts": dt.date.today().isoformat()})
-        state["recent_sources"] = state["recent_sources"][-200:]
-    if domains:
-        d = domains[0]
-        state.setdefault("recent_domains", []).append({"domain": d, "ts": dt.date.today().isoformat()})
-        state["recent_domains"] = state["recent_domains"][-200:]
-    save_state(state)
-
-# --- Garde-fous quote: seulement QUOTE_HANDLE + post original ---
 def is_original_post(p) -> bool:
     try:
         return getattr(p, "reply", None) is None and getattr(p, "repost", None) is None
@@ -374,7 +383,6 @@ def is_from_quote_handle(p) -> bool:
     except Exception:
         return False
 
-# --- Sélection post original d'un acteur ---
 def pick_latest_original_post_from_actor(client: Client, actor: str, limit: int = 10):
     try:
         feed = get_author_feed_compat(client, actor=actor, limit=limit)
@@ -388,7 +396,48 @@ def pick_latest_original_post_from_actor(client: Client, actor: str, limit: int 
         print(f"[pick original err:{actor}] {e}")
     return None
 
-# --- Reposts avec diversité + quotes (safe) ---
+# --- Pipeline ---
+def engage_opt_in(client: Client, state: Dict[str, Any]):
+    mentions = fetch_mentions_and_replies(client, state)
+    random.shuffle(mentions)
+    engagements = 0
+    for n in mentions:
+        if engagements >= MAX_ENGAGEMENTS_PER_RUN:
+            break
+        uri = getattr(n, "uri", None)
+        cid = getattr(n, "cid", None)
+        if not uri or not cid:
+            continue
+        if random.random() < 0.75:
+            if safe_like(client, uri, cid):
+                engagements += 1
+                print(f"Like mention: {uri}")
+        else:
+            reply_text = random.choice(["Thanks!", "Appreciate it 🙏", "Thanks for the tag ✨"]) \
+                         if random.random() < 0.7 else random.choice(["✨", "👏", "👍"])
+            if safe_reply(client, uri, cid, reply_text):
+                engagements += 1
+                print(f"Reply mention: {uri} -> {reply_text}")
+        nid = getattr(n, "cid", None) or getattr(n, "id", None) or getattr(n, "uri", None)
+        if nid:
+            state.setdefault("processed_notifications", []).append(nid)
+            state["processed_notifications"] = state["processed_notifications"][-500:]
+            save_state(state)
+        random_sleep()
+
+def maybe_original_post(client: Client):
+    if random.random() >= DO_ORIGINAL_POST_WEIGHT:
+        print("Skip original post this run.")
+        return
+    text = random.choice(ORIGINAL_POSTS)
+    if random.random() < APPEND_LINK_PROB:
+        text += " " + (LINK_SITE if random.random() < 0.5 else LINK_OPENSEA)
+    try:
+        resp = client.send_post(text=text)
+        print(f"Original post: {text} -> {getattr(resp, 'uri', '')}")
+    except Exception as e:
+        print(f"[post err] {e}")
+
 def repost_from_sources_with_quotes(client: Client, state: Dict[str, Any]):
     if MAX_REPOSTS_PER_RUN <= 0:
         print("Repost cap is 0. Skipping reposts.")
@@ -405,6 +454,10 @@ def repost_from_sources_with_quotes(client: Client, state: Dict[str, Any]):
             print("No eligible original post from QUOTE_HANDLE to quote.")
             break
 
+        if _uri_recent(state, getattr(p, "uri", "")):
+            print("Skip quote: already posted this URI recently.")
+            break
+
         actor   = _actor_of(p)
         domains = _extract_domains_from_post(p)
         dom_key = domains[0] if domains else ""
@@ -414,9 +467,9 @@ def repost_from_sources_with_quotes(client: Client, state: Dict[str, Any]):
         if dom_key and not _is_cooled(state.get("recent_domains", []), "domain", dom_key):
             break
 
-        # 👉 Ici seulement on ajoute la petite phrase + lien
         ok = safe_quote_repost(client, p.uri, p.cid, build_quote_text())
         if ok:
+            _remember_uri(state, getattr(p, "uri", ""))
             done_quotes  += 1
             done_reposts += 1
             print(f"Quote-retweet from @{QUOTE_HANDLE}: {p.uri}")
@@ -437,6 +490,9 @@ def repost_from_sources_with_quotes(client: Client, state: Dict[str, Any]):
                 post = getattr(item, "post", None)
                 if not post or not is_original_post(post):
                     continue
+                if _uri_recent(state, getattr(post, "uri", "")):
+                    continue
+
                 domains = _extract_domains_from_post(post)
                 dom_key = domains[0] if domains else ""
                 if not _is_cooled(state.get("recent_sources", []), "actor", actor):
@@ -447,6 +503,7 @@ def repost_from_sources_with_quotes(client: Client, state: Dict[str, Any]):
                     continue
 
                 if safe_repost(client, post.uri, post.cid):
+                    _remember_uri(state, getattr(post, "uri", ""))
                     done_reposts += 1
                     print(f"Repost (simple) from {actor}: {post.uri}")
                     _record_source_and_domain(state, actor, domains)
@@ -456,7 +513,7 @@ def repost_from_sources_with_quotes(client: Client, state: Dict[str, Any]):
             print(f"[source err:{actor}] {e}")
             continue
 
-    # 3) Complément via discovery (repost simple) avec tri par score + diversité (jamais de quote ici)
+    # 3) Complément via discovery (repost simple) avec tri par score + diversité
     if done_reposts < MAX_REPOSTS_PER_RUN:
         remaining = MAX_REPOSTS_PER_RUN - done_reposts
         extra = repost_via_discovery(client, state, remaining)
@@ -481,6 +538,8 @@ def repost_via_discovery(client: Client, state: Dict[str, Any], remaining_needed
             uri = getattr(p, "uri", None); cid = getattr(p, "cid", None)
             if not uri or not cid:
                 continue
+            if _uri_recent(state, uri):
+                continue
 
             actor   = _actor_of(p)
             domains = _extract_domains_from_post(p)
@@ -497,8 +556,8 @@ def repost_via_discovery(client: Client, state: Dict[str, Any], remaining_needed
             if score_post_for_art(p) < 2:
                 continue
 
-            # 👉 Discovery = repost simple, jamais de phrase/lien
             if safe_repost(client, uri, cid):
+                _remember_uri(state, uri)
                 count += 1
                 used_authors.add(actor)
                 if dom_key: used_domains.add(dom_key)
@@ -538,19 +597,25 @@ def discovery_likes_and_maybe_reposts(client: Client):
 
 # --- MAIN ---
 if __name__ == "__main__":
+    # Garde-fou horaire
+    now = _now_local()
+    if _is_quiet(now) or not _is_evening(now):
+        print(f"Outside window (evening-only). Local time={now.strftime('%Y-%m-%d %H:%M')}. Exit.")
+        raise SystemExit(0)
+
     client = login()
 
     # 1) Engagements opt-in (mentions/réponses)
     state = load_state()
     engage_opt_in(client, state)
 
-    # 2) Occasionnellement, un post original
+    # 2) Occasionnellement, un post original (reste rare)
     maybe_original_post(client)
 
     # 3) Découverte (likes) selon poids
     discovery_likes_and_maybe_reposts(client)
 
-    # 4) Reposts (quotes strictement pour QUOTE_HANDLE, sinon repost simple)
+    # 4) Reposts (quotes strictement pour QUOTE_HANDLE, sinon repost simple) avec anti-doublon d'URI
     repost_from_sources_with_quotes(client, state)
 
-    print("Bot2 run completed (creative + safe quotes).")
+    print("Bot2 run completed (evening-only, cooldowns, no duplicates).")

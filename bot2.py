@@ -384,7 +384,11 @@ def score_post_for_art(p) -> int:
     if any(k in t for k in KEYWORDS_BAD):
         score -= 2
     try:
-        if getattr(p, "reply", None) is not None or getattr(p, "repost", None) is not None:
+        # Si c'est une réponse ou un repost, on pénalise
+        rec = getattr(p, "record", None)
+        if rec is not None and getattr(rec, "reply", None) is not None:
+            score -= 2
+        if getattr(p, "repost", None) is not None:
             score -= 2
     except Exception:
         pass
@@ -400,8 +404,15 @@ def _actor_of(p) -> str:
 
 
 def is_original_post(p) -> bool:
+    """True si le post n'est PAS une réponse (i.e., post racine).
+    Sur Bluesky, l'info est dans record.reply, pas au niveau racine.
+    """
     try:
-        return getattr(p, "reply", None) is None and getattr(p, "repost", None) is None
+        rec = getattr(p, "record", None)
+        if rec is None:
+            return False
+        # record.reply présent => c'est une réponse
+        return getattr(rec, "reply", None) is None
     except Exception:
         return False
 
@@ -419,8 +430,18 @@ def pick_latest_original_post_from_actor(client: Client, actor: str, limit: int 
     try:
         feed = get_author_feed_compat(client, actor=actor, limit=limit)
         for item in (getattr(feed, "feed", []) or []):
+            # Ignorer les REPOSTS du compte source (item.reason present)
+            if getattr(item, "reason", None) is not None:
+                continue
             post = getattr(item, "post", None)
             if not post:
+                continue
+            # S'assurer que le post est bien émis par l'acteur demandé
+            try:
+                ph = getattr(getattr(post, "author", None), "handle", "") or ""
+                if ph != actor:
+                    continue
+            except Exception:
                 continue
             # Strict: uniquement des posts ORIGINAUX AVEC IMAGE
             if is_original_post(post) and _has_image_embed(post):
@@ -531,8 +552,19 @@ def repost_from_sources_with_quotes(client: Client, state: Dict[str, Any]):
         try:
             feed = get_author_feed_compat(client, actor=actor, limit=5)
             for item in (getattr(feed, "feed", []) or []):
+                # Ignorer les reposts (raison présente) et vérifier l'auteur
+                if getattr(item, "reason", None) is not None:
+                    continue
                 post = getattr(item, "post", None)
-                if not post or not is_original_post(post) or not _has_image_embed(post):
+                if not post:
+                    continue
+                try:
+                    ph = getattr(getattr(post, "author", None), "handle", "") or ""
+                    if ph != actor:
+                        continue
+                except Exception:
+                    continue
+                if not is_original_post(post) or not _has_image_embed(post):
                     continue
                 if _uri_recent(state, getattr(post, "uri", "")):
                     continue

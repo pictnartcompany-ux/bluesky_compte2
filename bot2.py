@@ -15,7 +15,7 @@ STATE_FILE = "bot2_state.json"
 
 # --- Time window (Europe/Brussels) ---
 TIMEZONE = "Europe/Brussels"
-EVENING_START = 19  # 19:00 inclus
+EVENING_START = 18  # 18:00 inclus
 EVENING_END = 23    # 23:00 exclu
 QUIET_START = 23    # nuit 23:00
 QUIET_END = 7       # -> 07:00

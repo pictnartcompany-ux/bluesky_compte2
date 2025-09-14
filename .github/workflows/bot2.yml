@@ -1,7 +1,7 @@
 name: bluesky-bot2-70-30
 on:
   schedule:
-    - cron: "15 15,17-20 * * *"
+    - cron: "15 15,17-21 * * *"
   workflow_dispatch: {}
 jobs:
   run-bot2:

@@ -12,12 +12,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # DEBUG : montre ce qui a été cloné
+      # DEBUG : montre ce qui a été cloné (chemins exacts !)
       - name: Show workspace
         run: |
           pwd
+          echo "--- repo root ---"
           ls -la
-          echo "--- bluesky_compte2 listing ---"
+          echo "--- try bluesky_compte2 ---"
           ls -la bluesky_compte2 || true
 
       - name: Setup Python
@@ -26,26 +27,37 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install deps
-        run: pip install -r bluesky_compte2/requirements.txt
+      # Installe selon ce qui existe (racine ou sous-dossier) ; fallback = atproto
+      - name: Install deps (auto-detect)
+        run: |
+          if [ -f bluesky_compte2/requirements.txt ]; then
+            pip install -r bluesky_compte2/requirements.txt
+            echo "CODE_DIR=bluesky_compte2" >> $GITHUB_ENV
+          elif [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+            echo "CODE_DIR=." >> $GITHUB_ENV
+          else
+            pip install "atproto>=0.0.45"
+            echo "CODE_DIR=bluesky_compte2" >> $GITHUB_ENV
+          fi
 
       - name: Compute day key
         id: day
         run: echo "day=$(date +%F)" >> $GITHUB_OUTPUT
 
-      # State persistant de Bot2
+      # Cache du state (chemin dépendant de CODE_DIR)
       - name: Restore bot2 state cache
         id: cache-bot2
         uses: actions/cache/restore@v4
         with:
-          path: bluesky_compte2/bot2_state.json
+          path: ${{ env.CODE_DIR }}/bot2_state.json
           key: bot2state-${{ steps.day.outputs.day }}
           restore-keys: |
             bot2state-
 
-      # (optionnel) voir le state avant
-      # - name: Show bot2_state.json (before)
-      #   run: cat bluesky_compte2/bot2_state.json || true
+      # (Optionnel) Voir le state avant
+      - name: Show bot2_state.json (before)
+        run: cat "${{ env.CODE_DIR }}/bot2_state.json" || echo "{}"
 
       - name: Run bot2
         env:
@@ -62,15 +74,15 @@ jobs:
           BOT2_QUERY: ${{ vars.BOT2_QUERY }}
           BOT2_LINK_SITE: ${{ vars.BOT2_LINK_SITE }}
           BOT2_LINK_OPENSEA: ${{ vars.BOT2_LINK_OPENSEA }}
-        run: python bluesky_compte2/bot2.py
+        run: python "${{ env.CODE_DIR }}/bot2.py"
 
-      # (optionnel) voir le state après
+      # (Optionnel) Voir le state après
       - name: Show bot2_state.json (after)
-        run: cat bluesky_compte2/bot2_state.json || true
+        run: cat "${{ env.CODE_DIR }}/bot2_state.json" || echo "{}"
 
       - name: Save updated bot2 state cache
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: bluesky_compte2/bot2_state.json
+          path: ${{ env.CODE_DIR }}/bot2_state.json
           key: bot2state-${{ steps.day.outputs.day }}-${{ github.run_id }}

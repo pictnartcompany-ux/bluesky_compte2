@@ -12,6 +12,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # DEBUG : montre ce qui a été cloné
+      - name: Show workspace
+        run: |
+          pwd
+          ls -la
+          echo "--- bluesky_compte2 listing ---"
+          ls -la bluesky_compte2 || true
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -19,13 +27,13 @@ jobs:
           cache: "pip"
 
       - name: Install deps
-        working-directory: bluesky_compte2
-        run: pip install -r requirements.txt
+        run: pip install -r bluesky_compte2/requirements.txt
 
       - name: Compute day key
         id: day
         run: echo "day=$(date +%F)" >> $GITHUB_OUTPUT
 
+      # State persistant de Bot2
       - name: Restore bot2 state cache
         id: cache-bot2
         uses: actions/cache/restore@v4
@@ -35,21 +43,17 @@ jobs:
           restore-keys: |
             bot2state-
 
-      # (debug utile la 1re fois)
-      - name: Show working dir & files
-        working-directory: bluesky_compte2
-        run: |
-          pwd
-          ls -la
+      # (optionnel) voir le state avant
+      # - name: Show bot2_state.json (before)
+      #   run: cat bluesky_compte2/bot2_state.json || true
 
       - name: Run bot2
-        working-directory: bluesky_compte2
         env:
           BSKY2_HANDLE: ${{ secrets.BSKY2_HANDLE }}
           BSKY2_APP_PASSWORD: ${{ secrets.BSKY2_APP_PASSWORD }}
           BOT2_MAX_ENG_PER_RUN: ${{ vars.BOT2_MAX_ENG_PER_RUN || '1' }}
           BOT2_REPOST_LIMIT:    ${{ vars.BOT2_REPOST_LIMIT    || '2' }}
-          BOT2_DISCOVERY_WEIGHT: ${{ vars.BOT2_DISCOVERY_WEIGHT|| '0.4' }}
+          BOT2_DISCOVERY_WEIGHT: ${{ vars.BOT2_DISCOVERY_WEIGHT || '0.4' }}
           BOT2_LIKE_LIMIT:      ${{ vars.BOT2_LIKE_LIMIT      || '2' }}
           BOT2_POST_COOLDOWN_DAYS: ${{ vars.BOT2_POST_COOLDOWN_DAYS || '30' }}
           BOT2_SOURCE_COOLDOWN_DAYS: ${{ vars.BOT2_SOURCE_COOLDOWN_DAYS || '3' }}
@@ -58,7 +62,11 @@ jobs:
           BOT2_QUERY: ${{ vars.BOT2_QUERY }}
           BOT2_LINK_SITE: ${{ vars.BOT2_LINK_SITE }}
           BOT2_LINK_OPENSEA: ${{ vars.BOT2_LINK_OPENSEA }}
-        run: python bot2.py
+        run: python bluesky_compte2/bot2.py
+
+      # (optionnel) voir le state après
+      - name: Show bot2_state.json (after)
+        run: cat bluesky_compte2/bot2_state.json || true
 
       - name: Save updated bot2 state cache
         if: always()

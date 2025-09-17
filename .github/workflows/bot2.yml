@@ -1,1 +1,68 @@
-name: bluesky-bot2-70-30 on: schedule: - cron: "15 16,18-21 * * *" workflow_dispatch: {} jobs: run-bot2: runs-on: ubuntu-latest steps: - uses: actions/checkout@v4 - uses: actions/setup-python@v5 with: python-version: '3.x' - name: Install deps run: pip install atproto>=0.0.45 - name: Run bot2 env: BSKY2_HANDLE: ${{ secrets.BSKY2_HANDLE }} BSKY2_APP_PASSWORD: ${{ secrets.BSKY2_APP_PASSWORD }} BOT2_QUERY: ${{ vars.BOT2_QUERY }} BOT2_LIKE_LIMIT: ${{ vars.BOT2_LIKE_LIMIT }} BOT2_REPOST_LIMIT: ${{ vars.BOT2_REPOST_LIMIT }} BOT2_SOURCE_HANDLES: ${{ vars.BOT2_SOURCE_HANDLES }} BOT2_DISCOVERY_WEIGHT: ${{ vars.BOT2_DISCOVERY_WEIGHT }} run: python bot2.py
+name: bluesky-bot2-70-30
+
+on:
+  schedule:
+    - cron: "15 16,18-21 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  run-bot2:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        working-directory: bluesky_compte2
+        run: pip install -r requirements.txt
+
+      - name: Compute day key
+        id: day
+        run: echo "day=$(date +%F)" >> $GITHUB_OUTPUT
+
+      - name: Restore bot2 state cache
+        id: cache-bot2
+        uses: actions/cache/restore@v4
+        with:
+          path: bluesky_compte2/bot2_state.json
+          key: bot2state-${{ steps.day.outputs.day }}
+          restore-keys: |
+            bot2state-
+
+      # (debug utile la 1re fois)
+      - name: Show working dir & files
+        working-directory: bluesky_compte2
+        run: |
+          pwd
+          ls -la
+
+      - name: Run bot2
+        working-directory: bluesky_compte2
+        env:
+          BSKY2_HANDLE: ${{ secrets.BSKY2_HANDLE }}
+          BSKY2_APP_PASSWORD: ${{ secrets.BSKY2_APP_PASSWORD }}
+          BOT2_MAX_ENG_PER_RUN: ${{ vars.BOT2_MAX_ENG_PER_RUN || '1' }}
+          BOT2_REPOST_LIMIT:    ${{ vars.BOT2_REPOST_LIMIT    || '2' }}
+          BOT2_DISCOVERY_WEIGHT: ${{ vars.BOT2_DISCOVERY_WEIGHT|| '0.4' }}
+          BOT2_LIKE_LIMIT:      ${{ vars.BOT2_LIKE_LIMIT      || '2' }}
+          BOT2_POST_COOLDOWN_DAYS: ${{ vars.BOT2_POST_COOLDOWN_DAYS || '30' }}
+          BOT2_SOURCE_COOLDOWN_DAYS: ${{ vars.BOT2_SOURCE_COOLDOWN_DAYS || '3' }}
+          BOT2_QUOTE_SHARE: ${{ vars.BOT2_QUOTE_SHARE || '0.66' }}
+          BOT2_SOURCE_HANDLES: ${{ vars.BOT2_SOURCE_HANDLES }}
+          BOT2_QUERY: ${{ vars.BOT2_QUERY }}
+          BOT2_LINK_SITE: ${{ vars.BOT2_LINK_SITE }}
+          BOT2_LINK_OPENSEA: ${{ vars.BOT2_LINK_OPENSEA }}
+        run: python bot2.py
+
+      - name: Save updated bot2 state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: bluesky_compte2/bot2_state.json
+          key: bot2state-${{ steps.day.outputs.day }}-${{ github.run_id }}
